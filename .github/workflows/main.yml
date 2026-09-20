@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       rdp_password:
-        description: 'RDP Password (min 8 chars, strong rakho)'
+        description: 'RDP Password (koi bhi rakh sakte ho)'
         required: true
-        default: 'India@2025#RDP'
+        default: 'Prateek@3000!'
       session_minutes:
         description: 'Session duration in minutes (max 355)'
         required: true
@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      # ---------- Step 1: RDP Enable ----------
+      # ---------- Step 1: Enable RDP ----------
       - name: Enable Remote Desktop (RDP)
         shell: powershell
         run: |
@@ -36,29 +36,52 @@ jobs:
           Start-Service TermService
           Set-Service -Name UmRdpService -StartupType Automatic
           Start-Service UmRdpService
+          Write-Host "RDP enabled successfully."
 
       # ---------- Step 2: Set Password & User ----------
       - name: Configure RDP User & Password
         shell: powershell
         run: |
+          Write-Host "===== Disabling password complexity policy ====="
+          secedit /export /cfg C:\secpol.cfg | Out-Null
+          (Get-Content C:\secpol.cfg) `
+            -replace "PasswordComplexity = 1", "PasswordComplexity = 0" `
+            -replace "MinimumPasswordLength = \d+", "MinimumPasswordLength = 0" `
+            | Out-File C:\secpol.cfg -Encoding ascii
+          secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY | Out-Null
+          Remove-Item C:\secpol.cfg -Force -ErrorAction SilentlyContinue
+
           $pass = ConvertTo-SecureString -AsPlainText "${{ github.event.inputs.rdp_password }}" -Force
 
           Write-Host "===== Setting password for runneradmin ====="
           Set-LocalUser -Name "runneradmin" -Password $pass
+          Write-Host "Password set successfully."
 
           Write-Host "===== Adding user to Administrators ====="
-          Add-LocalGroupMember -Group "Administrators" -Member "runneradmin" -ErrorAction SilentlyContinue
+          try {
+            Add-LocalGroupMember -Group "Administrators" -Member "runneradmin" -ErrorAction Stop
+            Write-Host "Added to Administrators."
+          } catch {
+            Write-Host "Skipped (already member): $($_.Exception.Message)"
+          }
 
-          Write-Host "===== Creating RDP access for user ====="
-          $sid = (New-Object System.Security.Principal.NTAccount("runneradmin")).Translate([System.Security.Principal.SecurityIdentifier]).Value
-          $rdpGroup = "S-1-5-32-555"
-          $objUser = [ADSI]"WinNT://./Remote Desktop Users,group"
-          $objUser.Add("WinNT://./runneradmin,user") 2>$null
+          Write-Host "===== Adding user to Remote Desktop Users ====="
+          try {
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction Stop
+            Write-Host "Added to Remote Desktop Users."
+          } catch {
+            Write-Host "Skipped (already member): $($_.Exception.Message)"
+          }
 
+          Write-Host "===== Verifying groups ====="
+          net localgroup Administrators
+          net localgroup "Remote Desktop Users"
+
+          Write-Host ""
           Write-Host "Username : runneradmin"
           Write-Host "Password : ${{ github.event.inputs.rdp_password }}"
 
-      # ---------- Step 3: Install Bore (TCP tunnel) ----------
+      # ---------- Step 3: Download Bore ----------
       - name: Download & Install Bore
         shell: powershell
         run: |
@@ -80,21 +103,21 @@ jobs:
           Write-Host "===== Starting Bore tunnel for RDP (port 3389) ====="
 
           $logFile = "$env:TEMP\bore.log"
-          $proc = Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
+          $errFile = "$env:TEMP\bore.err.log"
+
+          Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
                   -ArgumentList "local 3389 --to bore.pub" `
                   -RedirectStandardOutput $logFile `
-                  -RedirectStandardError "$env:TEMP\bore.err.log" `
-                  -PassThru -WindowStyle Hidden
+                  -RedirectStandardError $errFile `
+                  -WindowStyle Hidden
 
-          Write-Host "Bore PID: $($proc.Id)"
-          Start-Sleep -Seconds 8
+          Start-Sleep -Seconds 10
 
           Write-Host "===== Bore Log Output ====="
           Get-Content $logFile -ErrorAction SilentlyContinue
-          Get-Content "$env:TEMP\bore.err.log" -ErrorAction SilentlyContinue
+          Get-Content $errFile -ErrorAction SilentlyContinue
 
-          # Extract assigned port
-          $content = Get-Content $logFile -Raw
+          $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
           if ($content -match "bore\.pub:(\d+)") {
             $port = $matches[1]
             Write-Host ""
@@ -110,7 +133,7 @@ jobs:
             Get-Content $logFile
           }
 
-      # ---------- Step 5: Print Connection Info ----------
+      # ---------- Step 5: Show Connection Info ----------
       - name: Show Connection Details (Summary)
         shell: powershell
         run: |
@@ -124,11 +147,10 @@ jobs:
           Write-Host "#  DURATION : ${{ github.event.inputs.session_minutes }} minutes"
           Write-Host "##################################################"
           Write-Host ""
-          Write-Host "Open Windows 'Remote Desktop Connection' (mstsc)"
-          Write-Host "Paste '$env:RDP_HOST' in Computer field and connect."
+          Write-Host "Open mstsc and paste '$env:RDP_HOST' in Computer field."
           Write-Host ""
 
-          echo "### 🖥️ RDP Session Details" >> $env:GITHUB_STEP_SUMMARY
+          echo "### RDP Session Details" >> $env:GITHUB_STEP_SUMMARY
           echo "" >> $env:GITHUB_STEP_SUMMARY
           echo "| Item | Value |" >> $env:GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $env:GITHUB_STEP_SUMMARY
@@ -151,7 +173,6 @@ jobs:
             Start-Sleep -Seconds 60
             $elapsed += 60
 
-            # Check bore process is still running
             $boreRunning = Get-Process -Name "bore" -ErrorAction SilentlyContinue
             if (-not $boreRunning) {
               Write-Host "[WARN] Bore process died! Restarting..."
@@ -160,11 +181,11 @@ jobs:
                 -RedirectStandardOutput "$env:TEMP\bore.log" `
                 -RedirectStandardError "$env:TEMP\bore.err.log" `
                 -WindowStyle Hidden
-              Start-Sleep -Seconds 5
-              $newLog = Get-Content "$env:TEMP\bore.log" -Raw
+              Start-Sleep -Seconds 8
+              $newLog = Get-Content "$env:TEMP\bore.log" -Raw -ErrorAction SilentlyContinue
               if ($newLog -match "bore\.pub:(\d+)") {
                 $newPort = $matches[1]
-                Write-Host "[INFO] New RDP address: bore.pub:$newPort"
+                Write-Host "[INFO] New RDP address: bore.pub:$newPort (purana wala kaam nahi karega)"
               }
             }
 
