@@ -1,0 +1,184 @@
+name: RDP via Bore (5 Hour Session)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: 'RDP Password (min 8 chars, strong rakho)'
+        required: true
+        default: 'India@2025#RDP'
+      session_minutes:
+        description: 'Session duration in minutes (max 355)'
+        required: true
+        default: '300'
+
+jobs:
+  rdp:
+    name: Windows RDP with Bore Tunnel
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    steps:
+      # ---------- Step 1: RDP Enable ----------
+      - name: Enable Remote Desktop (RDP)
+        shell: powershell
+        run: |
+          Write-Host "===== Enabling RDP ====="
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+
+          Write-Host "===== Enabling Firewall Rules ====="
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-NetFirewallRule -DisplayGroup "Remote Desktop" -Enabled True -Profile Any
+
+          Write-Host "===== Starting RDP Services ====="
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service TermService
+          Set-Service -Name UmRdpService -StartupType Automatic
+          Start-Service UmRdpService
+
+      # ---------- Step 2: Set Password & User ----------
+      - name: Configure RDP User & Password
+        shell: powershell
+        run: |
+          $pass = ConvertTo-SecureString -AsPlainText "${{ github.event.inputs.rdp_password }}" -Force
+
+          Write-Host "===== Setting password for runneradmin ====="
+          Set-LocalUser -Name "runneradmin" -Password $pass
+
+          Write-Host "===== Adding user to Administrators ====="
+          Add-LocalGroupMember -Group "Administrators" -Member "runneradmin" -ErrorAction SilentlyContinue
+
+          Write-Host "===== Creating RDP access for user ====="
+          $sid = (New-Object System.Security.Principal.NTAccount("runneradmin")).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          $rdpGroup = "S-1-5-32-555"
+          $objUser = [ADSI]"WinNT://./Remote Desktop Users,group"
+          $objUser.Add("WinNT://./runneradmin,user") 2>$null
+
+          Write-Host "Username : runneradmin"
+          Write-Host "Password : ${{ github.event.inputs.rdp_password }}"
+
+      # ---------- Step 3: Install Bore (TCP tunnel) ----------
+      - name: Download & Install Bore
+        shell: powershell
+        run: |
+          Write-Host "===== Downloading Bore binary ====="
+          $url = "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\bore.zip"
+
+          Write-Host "===== Extracting ====="
+          Expand-Archive -Path "$env:TEMP\bore.zip" -DestinationPath "$env:TEMP\bore" -Force
+
+          Write-Host "===== Verify ====="
+          Get-ChildItem "$env:TEMP\bore"
+          & "$env:TEMP\bore\bore.exe" --version
+
+      # ---------- Step 4: Start Bore Tunnel ----------
+      - name: Start Bore Tunnel on port 3389
+        shell: powershell
+        run: |
+          Write-Host "===== Starting Bore tunnel for RDP (port 3389) ====="
+
+          $logFile = "$env:TEMP\bore.log"
+          $proc = Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
+                  -ArgumentList "local 3389 --to bore.pub" `
+                  -RedirectStandardOutput $logFile `
+                  -RedirectStandardError "$env:TEMP\bore.err.log" `
+                  -PassThru -WindowStyle Hidden
+
+          Write-Host "Bore PID: $($proc.Id)"
+          Start-Sleep -Seconds 8
+
+          Write-Host "===== Bore Log Output ====="
+          Get-Content $logFile -ErrorAction SilentlyContinue
+          Get-Content "$env:TEMP\bore.err.log" -ErrorAction SilentlyContinue
+
+          # Extract assigned port
+          $content = Get-Content $logFile -Raw
+          if ($content -match "bore\.pub:(\d+)") {
+            $port = $matches[1]
+            Write-Host ""
+            Write-Host "=================================================="
+            Write-Host "   RDP ADDRESS : bore.pub:$port"
+            Write-Host "   USERNAME    : runneradmin"
+            Write-Host "   PASSWORD    : ${{ github.event.inputs.rdp_password }}"
+            Write-Host "=================================================="
+            Write-Host ""
+            echo "RDP_HOST=bore.pub:$port" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "Port not found in log. Full log below:"
+            Get-Content $logFile
+          }
+
+      # ---------- Step 5: Print Connection Info ----------
+      - name: Show Connection Details (Summary)
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "##################################################"
+          Write-Host "#          RDP SESSION READY (5 HOURS)           #"
+          Write-Host "##################################################"
+          Write-Host "#  HOST     : $env:RDP_HOST"
+          Write-Host "#  USERNAME : runneradmin"
+          Write-Host "#  PASSWORD : ${{ github.event.inputs.rdp_password }}"
+          Write-Host "#  DURATION : ${{ github.event.inputs.session_minutes }} minutes"
+          Write-Host "##################################################"
+          Write-Host ""
+          Write-Host "Open Windows 'Remote Desktop Connection' (mstsc)"
+          Write-Host "Paste '$env:RDP_HOST' in Computer field and connect."
+          Write-Host ""
+
+          echo "### 🖥️ RDP Session Details" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $env:GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          echo "| **Host** | \`$env:RDP_HOST\` |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| **Username** | \`runneradmin\` |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| **Password** | \`${{ github.event.inputs.rdp_password }}\` |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| **Duration** | ${{ github.event.inputs.session_minutes }} minutes |" >> $env:GITHUB_STEP_SUMMARY
+
+      # ---------- Step 6: Keep Session Alive ----------
+      - name: Keep RDP Session Alive
+        shell: powershell
+        run: |
+          $mins = [int]"${{ github.event.inputs.session_minutes }}"
+          $seconds = $mins * 60
+          Write-Host "===== Session will stay alive for $mins minutes ====="
+          Write-Host "Start time: $(Get-Date)"
+
+          $elapsed = 0
+          while ($elapsed -lt $seconds) {
+            Start-Sleep -Seconds 60
+            $elapsed += 60
+
+            # Check bore process is still running
+            $boreRunning = Get-Process -Name "bore" -ErrorAction SilentlyContinue
+            if (-not $boreRunning) {
+              Write-Host "[WARN] Bore process died! Restarting..."
+              Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
+                -ArgumentList "local 3389 --to bore.pub" `
+                -RedirectStandardOutput "$env:TEMP\bore.log" `
+                -RedirectStandardError "$env:TEMP\bore.err.log" `
+                -WindowStyle Hidden
+              Start-Sleep -Seconds 5
+              $newLog = Get-Content "$env:TEMP\bore.log" -Raw
+              if ($newLog -match "bore\.pub:(\d+)") {
+                $newPort = $matches[1]
+                Write-Host "[INFO] New RDP address: bore.pub:$newPort"
+              }
+            }
+
+            $minsLeft = [math]::Floor(($seconds - $elapsed) / 60)
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Alive. Minutes remaining: $minsLeft"
+          }
+
+          Write-Host "===== Session time completed ====="
+
+      # ---------- Step 7: Cleanup ----------
+      - name: Cleanup
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "===== Cleaning up ====="
+          Stop-Process -Name "bore" -Force -ErrorAction SilentlyContinue
+          Write-Host "Bore tunnel closed."
