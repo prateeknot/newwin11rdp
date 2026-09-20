@@ -1,10 +1,10 @@
-name: RDP via Bore (5 Hour Session)
+name: RDP via Pinggy (5 Hour Session)
 
 on:
   workflow_dispatch:
     inputs:
       rdp_password:
-        description: 'RDP Password (koi bhi rakh sakte ho)'
+        description: 'RDP Password'
         required: true
         default: 'Prateek@3000!'
       session_minutes:
@@ -14,7 +14,7 @@ on:
 
 jobs:
   rdp:
-    name: Windows RDP with Bore Tunnel
+    name: Windows RDP via Pinggy Tunnel
     runs-on: windows-latest
     timeout-minutes: 355
 
@@ -36,9 +36,9 @@ jobs:
           Start-Service TermService
           Set-Service -Name UmRdpService -StartupType Automatic
           Start-Service UmRdpService
-          Write-Host "RDP enabled successfully."
+          Write-Host "RDP enabled."
 
-      # ---------- Step 2: Set Password & User ----------
+      # ---------- Step 2: Configure User & Password ----------
       - name: Configure RDP User & Password
         shell: powershell
         run: |
@@ -53,93 +53,109 @@ jobs:
 
           $pass = ConvertTo-SecureString -AsPlainText "${{ github.event.inputs.rdp_password }}" -Force
 
-          Write-Host "===== Setting password for runneradmin ====="
+          Write-Host "===== Setting password ====="
           Set-LocalUser -Name "runneradmin" -Password $pass
-          Write-Host "Password set successfully."
+          Write-Host "Password set."
 
-          Write-Host "===== Adding user to Administrators ====="
-          try {
-            Add-LocalGroupMember -Group "Administrators" -Member "runneradmin" -ErrorAction Stop
-            Write-Host "Added to Administrators."
-          } catch {
-            Write-Host "Skipped (already member): $($_.Exception.Message)"
-          }
+          Write-Host "===== Adding to Administrators ====="
+          try { Add-LocalGroupMember -Group "Administrators" -Member "runneradmin" -ErrorAction Stop; Write-Host "OK" }
+          catch { Write-Host "Skipped: $($_.Exception.Message)" }
 
-          Write-Host "===== Adding user to Remote Desktop Users ====="
-          try {
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction Stop
-            Write-Host "Added to Remote Desktop Users."
-          } catch {
-            Write-Host "Skipped (already member): $($_.Exception.Message)"
-          }
+          Write-Host "===== Adding to Remote Desktop Users ====="
+          try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction Stop; Write-Host "OK" }
+          catch { Write-Host "Skipped: $($_.Exception.Message)" }
 
-          Write-Host "===== Verifying groups ====="
-          net localgroup Administrators
-          net localgroup "Remote Desktop Users"
-
-          Write-Host ""
           Write-Host "Username : runneradmin"
           Write-Host "Password : ${{ github.event.inputs.rdp_password }}"
 
-      # ---------- Step 3: Download Bore ----------
-      - name: Download & Install Bore
+      # ---------- Step 3: Prepare SSH client for Pinggy ----------
+      - name: Prepare SSH Client
         shell: powershell
         run: |
-          Write-Host "===== Downloading Bore binary ====="
-          $url = "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\bore.zip"
+          Write-Host "===== Setting up SSH for Pinggy ====="
 
-          Write-Host "===== Extracting ====="
-          Expand-Archive -Path "$env:TEMP\bore.zip" -DestinationPath "$env:TEMP\bore" -Force
+          $sshDir = "$env:USERPROFILE\.ssh"
+          New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
 
-          Write-Host "===== Verify ====="
-          Get-ChildItem "$env:TEMP\bore"
-          & "$env:TEMP\bore\bore.exe" --version
+          # Disable strict host key checking so no prompts
+          @"
+          Host *
+              StrictHostKeyChecking no
+              UserKnownHostsFile NUL
+              ServerAliveInterval 30
+              ServerAliveCountMax 3
+              ExitOnForwardFailure yes
+          "@ | Out-File "$sshDir\config" -Encoding ascii
 
-      # ---------- Step 4: Start Bore Tunnel ----------
-      - name: Start Bore Tunnel on port 3389
+          Write-Host "===== Verifying ssh ====="
+          ssh -V
+
+      # ---------- Step 4: Start Pinggy Tunnel ----------
+      - name: Start Pinggy Tunnel for RDP
         shell: powershell
         run: |
-          Write-Host "===== Starting Bore tunnel for RDP (port 3389) ====="
+          Write-Host "===== Starting Pinggy tunnel for port 3389 ====="
 
-          $logFile = "$env:TEMP\bore.log"
-          $errFile = "$env:TEMP\bore.err.log"
+          $logFile = "$env:TEMP\pinggy.log"
+          $errFile = "$env:TEMP\pinggy.err.log"
 
-          Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
-                  -ArgumentList "local 3389 --to bore.pub" `
-                  -RedirectStandardOutput $logFile `
-                  -RedirectStandardError $errFile `
-                  -WindowStyle Hidden
+          # Delete old logs
+          Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+          Remove-Item $errFile -Force -ErrorAction SilentlyContinue
 
-          Start-Sleep -Seconds 10
+          # Start ssh tunnel in background
+          $sshArgs = @(
+            '-p','443',
+            '-o','StrictHostKeyChecking=no',
+            '-o','UserKnownHostsFile=NUL',
+            '-o','ServerAliveInterval=30',
+            '-o','ServerAliveCountMax=3',
+            '-R0:localhost:3389',
+            'a.pinggy.io'
+          )
 
-          Write-Host "===== Bore Log Output ====="
-          Get-Content $logFile -ErrorAction SilentlyContinue
-          Get-Content $errFile -ErrorAction SilentlyContinue
+          Start-Process -FilePath "ssh" -ArgumentList $sshArgs `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError $errFile `
+            -WindowStyle Hidden
 
-          $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
-          if ($content -match "bore\.pub:(\d+)") {
-            $port = $matches[1]
+          Write-Host "Waiting 25 seconds for Pinggy to assign public address..."
+          Start-Sleep -Seconds 25
+
+          Write-Host "===== Pinggy Output ====="
+          Get-Content $logFile -ErrorAction SilentlyContinue | Write-Host
+          Get-Content $errFile -ErrorAction SilentlyContinue | Write-Host
+
+          $content = (Get-Content $logFile -Raw -ErrorAction SilentlyContinue) + "`n" + (Get-Content $errFile -Raw -ErrorAction SilentlyContinue)
+
+          if ($content -match "tcp://([a-zA-Z0-9\.\-]+):(\d+)") {
+            $h = $matches[1]
+            $p = $matches[2]
             Write-Host ""
             Write-Host "=================================================="
-            Write-Host "   RDP ADDRESS : bore.pub:$port"
+            Write-Host "   RDP ADDRESS : $h`:$p"
             Write-Host "   USERNAME    : runneradmin"
             Write-Host "   PASSWORD    : ${{ github.event.inputs.rdp_password }}"
             Write-Host "=================================================="
             Write-Host ""
-            echo "RDP_HOST=bore.pub:$port" >> $env:GITHUB_ENV
+            echo "RDP_HOST=$h`:$p" >> $env:GITHUB_ENV
+            echo "RDP_HOSTNAME=$h" >> $env:GITHUB_ENV
+            echo "RDP_PORT=$p" >> $env:GITHUB_ENV
           } else {
-            Write-Host "Port not found in log. Full log below:"
+            Write-Host "[ERROR] Pinggy address not found in log."
+            Write-Host "Full log:"
             Get-Content $logFile
+            Get-Content $errFile
+            exit 1
           }
 
-      # ---------- Step 5: Show Connection Info ----------
+      # ---------- Step 5: Show Connection Summary ----------
       - name: Show Connection Details (Summary)
         shell: powershell
         run: |
           Write-Host ""
           Write-Host "##################################################"
-          Write-Host "#          RDP SESSION READY (5 HOURS)           #"
+          Write-Host "#        RDP SESSION READY (5 HOURS)             #"
           Write-Host "##################################################"
           Write-Host "#  HOST     : $env:RDP_HOST"
           Write-Host "#  USERNAME : runneradmin"
@@ -147,7 +163,7 @@ jobs:
           Write-Host "#  DURATION : ${{ github.event.inputs.session_minutes }} minutes"
           Write-Host "##################################################"
           Write-Host ""
-          Write-Host "Open mstsc and paste '$env:RDP_HOST' in Computer field."
+          Write-Host "mstsc kholo, Computer field me daalo: $env:RDP_HOST"
           Write-Host ""
 
           echo "### RDP Session Details" >> $env:GITHUB_STEP_SUMMARY
@@ -167,25 +183,42 @@ jobs:
           $seconds = $mins * 60
           Write-Host "===== Session will stay alive for $mins minutes ====="
           Write-Host "Start time: $(Get-Date)"
+          Write-Host "RDP HOST   : $env:RDP_HOST"
 
           $elapsed = 0
           while ($elapsed -lt $seconds) {
             Start-Sleep -Seconds 60
             $elapsed += 60
 
-            $boreRunning = Get-Process -Name "bore" -ErrorAction SilentlyContinue
-            if (-not $boreRunning) {
-              Write-Host "[WARN] Bore process died! Restarting..."
-              Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
-                -ArgumentList "local 3389 --to bore.pub" `
-                -RedirectStandardOutput "$env:TEMP\bore.log" `
-                -RedirectStandardError "$env:TEMP\bore.err.log" `
+            $sshAlive = Get-Process -Name "ssh" -ErrorAction SilentlyContinue
+            if (-not $sshAlive) {
+              Write-Host "[WARN] SSH tunnel died! Restarting Pinggy..."
+
+              $logFile = "$env:TEMP\pinggy.log"
+              $errFile = "$env:TEMP\pinggy.err.log"
+              Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+              Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+
+              $sshArgs = @(
+                '-p','443',
+                '-o','StrictHostKeyChecking=no',
+                '-o','UserKnownHostsFile=NUL',
+                '-o','ServerAliveInterval=30',
+                '-o','ServerAliveCountMax=3',
+                '-R0:localhost:3389',
+                'a.pinggy.io'
+              )
+              Start-Process -FilePath "ssh" -ArgumentList $sshArgs `
+                -RedirectStandardOutput $logFile `
+                -RedirectStandardError $errFile `
                 -WindowStyle Hidden
-              Start-Sleep -Seconds 8
-              $newLog = Get-Content "$env:TEMP\bore.log" -Raw -ErrorAction SilentlyContinue
-              if ($newLog -match "bore\.pub:(\d+)") {
-                $newPort = $matches[1]
-                Write-Host "[INFO] New RDP address: bore.pub:$newPort (purana wala kaam nahi karega)"
+
+              Start-Sleep -Seconds 20
+
+              $newContent = (Get-Content $logFile -Raw -ErrorAction SilentlyContinue) + "`n" + (Get-Content $errFile -Raw -ErrorAction SilentlyContinue)
+              if ($newContent -match "tcp://([a-zA-Z0-9\.\-]+):(\d+)") {
+                Write-Host "[INFO] NEW RDP ADDRESS: $($matches[1]):$($matches[2])"
+                Write-Host "[INFO] mstsc me ye naya address daalo!"
               }
             }
 
@@ -201,5 +234,5 @@ jobs:
         shell: powershell
         run: |
           Write-Host "===== Cleaning up ====="
-          Stop-Process -Name "bore" -Force -ErrorAction SilentlyContinue
-          Write-Host "Bore tunnel closed."
+          Stop-Process -Name "ssh" -Force -ErrorAction SilentlyContinue
+          Write-Host "SSH tunnel closed."
